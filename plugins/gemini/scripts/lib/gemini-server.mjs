@@ -1,0 +1,683 @@
+/**
+ * Gemini App Server — JSON-RPC server wrapping `gemini -p` CLI calls.
+ *
+ * Implements the same protocol as the Codex App Server so that the existing
+ * client code (app-server.mjs pattern) can connect without changes.
+ *
+ * Line-delimited JSON-RPC 2.0 over Unix sockets / Windows named pipes.
+ */
+
+import { randomUUID } from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
+import { spawn } from "node:child_process";
+import readline from "node:readline";
+
+const MAX_HISTORY_CHARS = 100_000;
+
+// ---------------------------------------------------------------------------
+// Thread persistence
+// ---------------------------------------------------------------------------
+
+function resolveThreadsDir(stateDir) {
+  return path.join(stateDir, "threads");
+}
+
+function resolveThreadDir(stateDir, threadId) {
+  return path.join(resolveThreadsDir(stateDir), threadId);
+}
+
+function readThreadMetadata(stateDir, threadId) {
+  const metaPath = path.join(resolveThreadDir(stateDir, threadId), "metadata.json");
+  try {
+    return JSON.parse(fs.readFileSync(metaPath, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function writeThreadMetadata(stateDir, threadId, metadata) {
+  const dir = resolveThreadDir(stateDir, threadId);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, "metadata.json"), JSON.stringify(metadata, null, 2));
+}
+
+function appendHistoryEntry(stateDir, threadId, entry) {
+  const dir = resolveThreadDir(stateDir, threadId);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.appendFileSync(path.join(dir, "history.jsonl"), `${JSON.stringify(entry)}\n`);
+}
+
+function readHistory(stateDir, threadId) {
+  const historyPath = path.join(resolveThreadDir(stateDir, threadId), "history.jsonl");
+  try {
+    const content = fs.readFileSync(historyPath, "utf8").trim();
+    if (!content) return [];
+    return content.split("\n").map((line) => JSON.parse(line));
+  } catch {
+    return [];
+  }
+}
+
+function listThreads(stateDir, options = {}) {
+  const threadsDir = resolveThreadsDir(stateDir);
+  if (!fs.existsSync(threadsDir)) return [];
+
+  const dirs = fs.readdirSync(threadsDir, { withFileTypes: true })
+    .filter((d) => d.isDirectory())
+    .map((d) => d.name);
+
+  const threads = [];
+  for (const id of dirs) {
+    const meta = readThreadMetadata(stateDir, id);
+    if (!meta) continue;
+    if (options.cwd && meta.cwd !== options.cwd) continue;
+    if (options.searchTerm && !meta.name?.includes(options.searchTerm)) continue;
+    threads.push(meta);
+  }
+
+  threads.sort((a, b) => (b.updatedAt || "").localeCompare(a.updatedAt || ""));
+  if (options.limit) {
+    threads.length = Math.min(threads.length, options.limit);
+  }
+  return threads;
+}
+
+// ---------------------------------------------------------------------------
+// Context assembly — build prompt from conversation history
+// ---------------------------------------------------------------------------
+
+function buildConversationPrompt(history, newInput) {
+  let historyText = "";
+  let totalChars = 0;
+
+  // Walk backwards to keep recent turns, summarize old ones
+  const entries = [...history];
+  const recentEntries = [];
+  const oldEntries = [];
+
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const entry = entries[i];
+    const entryLen = (entry.content || "").length;
+    if (totalChars + entryLen < MAX_HISTORY_CHARS) {
+      recentEntries.unshift(entry);
+      totalChars += entryLen;
+    } else {
+      oldEntries.unshift(...entries.slice(0, i + 1));
+      break;
+    }
+  }
+
+  if (oldEntries.length > 0) {
+    const summaryParts = oldEntries.map(
+      (e) => `[${e.role}]: ${(e.content || "").slice(0, 200)}...`
+    );
+    historyText += `[Previous conversation summary (${oldEntries.length} turns):\n${summaryParts.join("\n")}\n]\n\n`;
+  }
+
+  for (const entry of recentEntries) {
+    historyText += `[${entry.role}]: ${entry.content}\n\n`;
+  }
+
+  if (historyText) {
+    return `${historyText}[user]: ${newInput}`;
+  }
+  return newInput;
+}
+
+// ---------------------------------------------------------------------------
+// Gemini CLI spawner
+// ---------------------------------------------------------------------------
+
+function buildGeminiArgs(prompt, options = {}) {
+  const args = ["-p", prompt, "--output-format", "stream-json"];
+
+  if (options.model) {
+    args.push("-m", options.model);
+  }
+
+  if (options.sandbox === "workspace-write") {
+    args.push("--approval-mode", "auto_edit");
+  }
+
+  return args;
+}
+
+/**
+ * Spawn `gemini -p` and return a controller for the running process.
+ */
+function spawnGeminiProcess(prompt, options = {}) {
+  const args = buildGeminiArgs(prompt, options);
+  const env = { ...process.env, ...(options.env || {}), NO_COLOR: "1" };
+
+  const proc = spawn("gemini", args, {
+    cwd: options.cwd || process.cwd(),
+    env,
+    stdio: ["pipe", "pipe", "pipe"],
+    shell: process.platform === "win32" ? (process.env.SHELL || true) : false,
+    windowsHide: true
+  });
+
+  return proc;
+}
+
+// ---------------------------------------------------------------------------
+// Gemini stream-json → JSON-RPC notification translator
+// ---------------------------------------------------------------------------
+
+/**
+ * @param {import("readline").Interface} rl
+ * @param {string} threadId
+ * @param {string} turnId
+ * @param {(notification: object) => void} emit
+ * @returns {Promise<{status: number, finalMessage: string, stderr: string, reasoningSummary: string[]}>}
+ */
+function createStreamTranslator(rl, threadId, turnId, emit) {
+  return new Promise((resolve) => {
+    let finalMessage = "";
+    let stderr = "";
+    const reasoningSummary = [];
+    let itemCounter = 0;
+    let currentMessageText = "";
+
+    rl.on("line", (line) => {
+      if (!line.trim()) return;
+
+      let event;
+      try {
+        event = JSON.parse(line);
+      } catch {
+        return;
+      }
+
+      const eventType = event.type || event.event;
+
+      switch (eventType) {
+        case "init": {
+          emit({
+            method: "turn/started",
+            params: {
+              threadId,
+              turnId,
+              turn: { id: turnId, status: "inProgress" }
+            }
+          });
+          break;
+        }
+
+        case "message": {
+          const text = event.content || event.delta || event.message || "";
+          const role = event.role || "assistant";
+
+          if (role === "assistant") {
+            currentMessageText += text;
+
+            if (event.delta) {
+              // Streaming delta — accumulate, don't emit item yet
+            } else {
+              // Complete message
+              const itemId = `item-${++itemCounter}`;
+              emit({
+                method: "item/completed",
+                params: {
+                  threadId,
+                  turnId,
+                  itemId,
+                  item: {
+                    type: "agentMessage",
+                    text: currentMessageText || text,
+                    phase: "assistant"
+                  }
+                }
+              });
+              currentMessageText = "";
+            }
+          }
+          break;
+        }
+
+        case "tool_use": {
+          const itemId = `item-${++itemCounter}`;
+          const toolName = event.name || event.tool || "unknown";
+          const toolArgs = event.arguments || event.args || {};
+
+          // Detect file changes vs shell commands
+          if (toolName === "write_file" || toolName === "replace") {
+            emit({
+              method: "item/started",
+              params: {
+                threadId,
+                turnId,
+                itemId,
+                item: {
+                  type: "fileChange",
+                  changes: [{ path: toolArgs.path || toolArgs.file || "unknown" }]
+                }
+              }
+            });
+          } else if (toolName === "run_shell_command") {
+            emit({
+              method: "item/started",
+              params: {
+                threadId,
+                turnId,
+                itemId,
+                item: {
+                  type: "commandExecution",
+                  command: toolArgs.command || String(toolArgs),
+                  status: "running"
+                }
+              }
+            });
+          } else {
+            emit({
+              method: "item/started",
+              params: {
+                threadId,
+                turnId,
+                itemId,
+                item: {
+                  type: "mcpToolCall",
+                  tool: toolName,
+                  status: "running"
+                }
+              }
+            });
+          }
+          break;
+        }
+
+        case "tool_result": {
+          const itemId = `item-${++itemCounter}`;
+          const toolName = event.name || event.tool || "unknown";
+          const output = event.output || event.result || "";
+          const exitCode = event.exitCode ?? 0;
+
+          if (toolName === "write_file" || toolName === "replace") {
+            emit({
+              method: "item/completed",
+              params: {
+                threadId,
+                turnId,
+                itemId,
+                item: {
+                  type: "fileChange",
+                  changes: [{ path: event.path || "unknown" }]
+                }
+              }
+            });
+          } else if (toolName === "run_shell_command") {
+            emit({
+              method: "item/completed",
+              params: {
+                threadId,
+                turnId,
+                itemId,
+                item: {
+                  type: "commandExecution",
+                  command: event.command || toolName,
+                  exitCode,
+                  status: exitCode === 0 ? "completed" : "failed"
+                }
+              }
+            });
+          } else {
+            emit({
+              method: "item/completed",
+              params: {
+                threadId,
+                turnId,
+                itemId,
+                item: {
+                  type: "mcpToolCall",
+                  tool: toolName,
+                  status: "completed"
+                }
+              }
+            });
+          }
+          break;
+        }
+
+        case "result": {
+          finalMessage = event.response || currentMessageText || "";
+          const stats = event.stats || {};
+
+          // Emit final message if not already emitted
+          if (finalMessage && currentMessageText) {
+            const itemId = `item-${++itemCounter}`;
+            emit({
+              method: "item/completed",
+              params: {
+                threadId,
+                turnId,
+                itemId,
+                item: {
+                  type: "agentMessage",
+                  text: finalMessage,
+                  phase: "final_answer"
+                }
+              }
+            });
+          }
+
+          // Emit turn completed
+          emit({
+            method: "turn/completed",
+            params: {
+              threadId,
+              turnId,
+              turn: {
+                id: turnId,
+                status: "completed",
+                stats
+              }
+            }
+          });
+          break;
+        }
+
+        case "error": {
+          stderr += (event.message || event.error || JSON.stringify(event)) + "\n";
+          break;
+        }
+      }
+    });
+
+    rl.on("close", () => {
+      // If no result event was received, emit turn/completed
+      if (!finalMessage) {
+        finalMessage = currentMessageText || "";
+        emit({
+          method: "turn/completed",
+          params: {
+            threadId,
+            turnId,
+            turn: {
+              id: turnId,
+              status: finalMessage ? "completed" : "failed"
+            }
+          }
+        });
+      }
+      resolve({ status: stderr ? 1 : 0, finalMessage, stderr, reasoningSummary });
+    });
+  });
+}
+
+// ---------------------------------------------------------------------------
+// GeminiAppServer — the JSON-RPC request handler
+// ---------------------------------------------------------------------------
+
+export class GeminiAppServer {
+  constructor(stateDir, options = {}) {
+    this.stateDir = stateDir;
+    this.options = options;
+    /** @type {Map<string, import("child_process").ChildProcess>} threadId → running gemini process */
+    this.activeProcesses = new Map();
+    this.initialized = false;
+  }
+
+  /**
+   * Handle a JSON-RPC request and return the result.
+   * @param {string} method
+   * @param {object} params
+   * @param {(notification: object) => void} emit — callback to send notifications
+   * @returns {Promise<object>}
+   */
+  async handleRequest(method, params, emit) {
+    switch (method) {
+      case "initialize":
+        return this.handleInitialize(params);
+      case "thread/start":
+        return this.handleThreadStart(params);
+      case "thread/resume":
+        return this.handleThreadResume(params);
+      case "thread/name/set":
+        return this.handleThreadNameSet(params);
+      case "thread/list":
+        return this.handleThreadList(params);
+      case "turn/start":
+        return this.handleTurnStart(params, emit);
+      case "turn/interrupt":
+        return this.handleTurnInterrupt(params);
+      case "review/start":
+        return this.handleReviewStart(params, emit);
+      default:
+        throw Object.assign(new Error(`Unknown method: ${method}`), { code: -32601 });
+    }
+  }
+
+  handleInitialize(params) {
+    this.initialized = true;
+    this.clientInfo = params.clientInfo;
+    return {
+      serverInfo: {
+        name: "gemini-app-server",
+        version: "0.1.0"
+      },
+      capabilities: {}
+    };
+  }
+
+  handleThreadStart(params) {
+    const threadId = randomUUID();
+    const now = new Date().toISOString();
+    const metadata = {
+      id: threadId,
+      name: null,
+      cwd: params.cwd || process.cwd(),
+      model: params.model || null,
+      sandbox: params.sandbox || "read-only",
+      serviceName: params.serviceName || "claude_code_gemini_plugin",
+      ephemeral: params.ephemeral ?? true,
+      createdAt: now,
+      updatedAt: now
+    };
+    writeThreadMetadata(this.stateDir, threadId, metadata);
+    return { thread: { id: threadId, name: null } };
+  }
+
+  handleThreadResume(params) {
+    const { threadId } = params;
+    const metadata = readThreadMetadata(this.stateDir, threadId);
+    if (!metadata) {
+      throw Object.assign(new Error(`Thread ${threadId} not found.`), { code: -32602 });
+    }
+
+    // Update model/sandbox if provided
+    if (params.model) metadata.model = params.model;
+    if (params.sandbox) metadata.sandbox = params.sandbox;
+    if (params.cwd) metadata.cwd = params.cwd;
+    metadata.updatedAt = new Date().toISOString();
+    writeThreadMetadata(this.stateDir, threadId, metadata);
+
+    return { thread: { id: threadId, name: metadata.name } };
+  }
+
+  handleThreadNameSet(params) {
+    const { threadId, name } = params;
+    const metadata = readThreadMetadata(this.stateDir, threadId);
+    if (!metadata) {
+      throw Object.assign(new Error(`Thread ${threadId} not found.`), { code: -32602 });
+    }
+    metadata.name = name;
+    metadata.updatedAt = new Date().toISOString();
+    writeThreadMetadata(this.stateDir, threadId, metadata);
+    return { threadId, name };
+  }
+
+  handleThreadList(params) {
+    const threads = listThreads(this.stateDir, {
+      cwd: params.cwd,
+      limit: params.limit,
+      searchTerm: params.searchTerm
+    });
+    return { data: threads };
+  }
+
+  async handleTurnStart(params, emit) {
+    const { threadId, input, model, effort, outputSchema } = params;
+    const metadata = readThreadMetadata(this.stateDir, threadId);
+    if (!metadata) {
+      throw Object.assign(new Error(`Thread ${threadId} not found.`), { code: -32602 });
+    }
+
+    const turnId = randomUUID();
+    const userText = (input || [])
+      .filter((i) => i.type === "text")
+      .map((i) => i.text)
+      .join("\n");
+
+    if (!userText) {
+      throw Object.assign(new Error("No text input provided."), { code: -32602 });
+    }
+
+    // Build prompt with conversation history
+    const history = readHistory(this.stateDir, threadId);
+    const fullPrompt = buildConversationPrompt(history, userText);
+
+    // Resolve options
+    const resolvedModel = model || metadata.model;
+    const sandbox = metadata.sandbox;
+
+    // Append user turn to history
+    appendHistoryEntry(this.stateDir, threadId, {
+      role: "user",
+      content: userText,
+      timestamp: new Date().toISOString()
+    });
+
+    // Spawn gemini process
+    const proc = spawnGeminiProcess(fullPrompt, {
+      cwd: metadata.cwd,
+      model: resolvedModel,
+      sandbox,
+      env: this.options.env
+    });
+
+    this.activeProcesses.set(threadId, proc);
+
+    // Setup stream translation
+    const rl = readline.createInterface({ input: proc.stdout });
+    proc.stdout.setEncoding("utf8");
+    proc.stderr.setEncoding("utf8");
+
+    let stderrContent = "";
+    proc.stderr.on("data", (chunk) => {
+      stderrContent += chunk;
+    });
+
+    const translationPromise = createStreamTranslator(rl, threadId, turnId, emit);
+
+    // Return immediately with turn info — notifications will stream
+    const result = { turn: { id: turnId, status: "inProgress" } };
+
+    // Wait for process to complete in background
+    translationPromise.then((translationResult) => {
+      this.activeProcesses.delete(threadId);
+
+      // Append assistant response to history
+      if (translationResult.finalMessage) {
+        appendHistoryEntry(this.stateDir, threadId, {
+          role: "assistant",
+          content: translationResult.finalMessage,
+          timestamp: new Date().toISOString()
+        });
+      }
+
+      // Update thread metadata
+      metadata.updatedAt = new Date().toISOString();
+      writeThreadMetadata(this.stateDir, threadId, metadata);
+    });
+
+    return result;
+  }
+
+  async handleTurnInterrupt(params) {
+    const { threadId, turnId } = params;
+    const proc = this.activeProcesses.get(threadId);
+    if (!proc) {
+      return { interrupted: false, detail: "No active process for this thread." };
+    }
+
+    try {
+      if (process.platform === "win32") {
+        spawn("taskkill", ["/pid", String(proc.pid), "/T", "/F"], {
+          stdio: "ignore",
+          windowsHide: true
+        });
+      } else {
+        proc.kill("SIGTERM");
+      }
+      this.activeProcesses.delete(threadId);
+      return { interrupted: true };
+    } catch (error) {
+      return { interrupted: false, detail: error.message };
+    }
+  }
+
+  async handleReviewStart(params, emit) {
+    // Gemini has no native review — delegate to turn/start with review prompt
+    const threadResult = this.handleThreadStart({
+      cwd: params.cwd,
+      model: params.model,
+      sandbox: "read-only",
+      serviceName: "claude_code_gemini_plugin",
+      ephemeral: true
+    });
+
+    const reviewPrompt = buildReviewPrompt(params.reviewTarget);
+    const turnResult = await this.handleTurnStart(
+      {
+        threadId: threadResult.thread.id,
+        input: [{ type: "text", text: reviewPrompt, text_elements: [] }],
+        model: params.model
+      },
+      emit
+    );
+
+    return {
+      reviewThreadId: threadResult.thread.id,
+      turn: turnResult.turn
+    };
+  }
+
+  shutdown() {
+    for (const [threadId, proc] of this.activeProcesses) {
+      try {
+        if (process.platform === "win32") {
+          spawn("taskkill", ["/pid", String(proc.pid), "/T", "/F"], {
+            stdio: "ignore",
+            windowsHide: true
+          });
+        } else {
+          proc.kill("SIGTERM");
+        }
+      } catch {
+        // Best-effort cleanup
+      }
+    }
+    this.activeProcesses.clear();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Helper: build review prompt from target info
+// ---------------------------------------------------------------------------
+
+function buildReviewPrompt(reviewTarget) {
+  if (!reviewTarget) {
+    return "Review the current code changes for bugs, security issues, and best practice violations. Provide structured feedback.";
+  }
+
+  if (reviewTarget.type === "uncommittedChanges") {
+    return "Review the uncommitted changes in this repository for bugs, security issues, performance problems, and best practice violations. Provide a thorough code review with specific file references and line numbers.";
+  }
+
+  if (reviewTarget.type === "baseBranch") {
+    return `Review all changes on the current branch compared to ${reviewTarget.branch}. Look for bugs, security issues, performance problems, and best practice violations. Provide a thorough code review with specific file references and line numbers.`;
+  }
+
+  return "Review the current code changes. Provide structured feedback on any issues found.";
+}
