@@ -14,7 +14,7 @@ If the user did not provide a question, use `AskUserQuestion` to ask what they w
 
 Run:
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/scripts/gemini-companion.mjs" task "$ARGUMENTS"
+node "${CLAUDE_PLUGIN_ROOT}/scripts/gemini-companion.mjs" task --model gemini-2.5-flash "$ARGUMENTS"
 ```
 
 Note: Do NOT add `--write`. This command is read-only by design.

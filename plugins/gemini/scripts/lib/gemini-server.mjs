@@ -176,7 +176,191 @@ function buildConversationPrompt(history, newInput) {
 }
 
 // ---------------------------------------------------------------------------
-// Gemini CLI spawner
+// Gemini REST API — direct fetch (fast path, no CLI boot overhead)
+// ---------------------------------------------------------------------------
+
+const GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta";
+const DEFAULT_MODEL = "gemini-2.5-flash";
+const TOKEN_EXPIRY_BUFFER_MS = 60_000; // refresh 1 min before expiry
+
+/**
+ * Load credentials: API key (env) or OAuth token (disk).
+ * Returns { type: "api-key", key } or { type: "oauth", accessToken } or null.
+ */
+function loadGeminiCredentials() {
+  // Priority 1: API key from environment
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (apiKey) {
+    return { type: "api-key", key: apiKey };
+  }
+
+  // Priority 2: OAuth token from disk
+  const homeDir = process.env.HOME || process.env.USERPROFILE || "";
+  if (!homeDir) return null;
+
+  const credsPath = path.join(homeDir, ".gemini", "oauth_creds.json");
+  try {
+    const raw = fs.readFileSync(credsPath, "utf8");
+    const creds = JSON.parse(raw);
+    if (!creds.access_token) return null;
+
+    // Check expiry
+    const now = Date.now();
+    if (creds.expiry_date && now >= creds.expiry_date - TOKEN_EXPIRY_BUFFER_MS) {
+      return null; // expired — caller should fall back to CLI
+    }
+
+    return { type: "oauth", accessToken: creds.access_token };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Build the Gemini API URL for streaming.
+ */
+function buildAPIUrl(model, creds) {
+  const modelId = model || DEFAULT_MODEL;
+  const base = `${GEMINI_API_BASE}/models/${modelId}:streamGenerateContent`;
+
+  if (creds.type === "api-key") {
+    return `${base}?alt=sse&key=${encodeURIComponent(creds.key)}`;
+  }
+  return `${base}?alt=sse`;
+}
+
+/**
+ * Build request headers.
+ */
+function buildAPIHeaders(creds) {
+  const headers = { "Content-Type": "application/json" };
+
+  if (creds.type === "oauth") {
+    headers["Authorization"] = `Bearer ${creds.accessToken}`;
+  }
+
+  // Enterprise workspace may require project header
+  const project = process.env.GOOGLE_CLOUD_PROJECT || process.env.GOOGLE_CLOUD_PROJECT_ID;
+  if (project) {
+    headers["x-goog-user-project"] = project;
+  }
+
+  return headers;
+}
+
+/**
+ * Build the Gemini API request body from a prompt string.
+ */
+function buildAPIBody(prompt) {
+  return {
+    contents: [{ parts: [{ text: prompt }] }]
+  };
+}
+
+/**
+ * Call Gemini REST API with SSE streaming, translating events to JSON-RPC notifications.
+ * Returns { status, finalMessage, stderr, reasoningSummary }.
+ */
+async function callGeminiAPIStream(prompt, model, creds, threadId, turnId, emit) {
+  const url = buildAPIUrl(model, creds);
+  const headers = buildAPIHeaders(creds);
+  const body = buildAPIBody(prompt);
+
+  const response = await fetch(url, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(body)
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text().catch(() => "");
+    throw new Error(`Gemini API error ${response.status}: ${errorText}`);
+  }
+
+  // Emit turn/started
+  emit({
+    method: "turn/started",
+    params: { threadId, turnId, turn: { id: turnId, status: "inProgress" } }
+  });
+
+  // Parse SSE stream
+  let finalMessage = "";
+  let itemCounter = 0;
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+
+    // Process complete SSE events
+    const lines = buffer.split("\n");
+    buffer = lines.pop() || ""; // keep incomplete line
+
+    for (const line of lines) {
+      if (!line.startsWith("data: ")) continue;
+      const jsonStr = line.slice(6).trim();
+      if (!jsonStr || jsonStr === "[DONE]") continue;
+
+      let chunk;
+      try {
+        chunk = JSON.parse(jsonStr);
+      } catch {
+        continue;
+      }
+
+      // Extract text from candidates
+      const candidates = chunk.candidates || [];
+      for (const candidate of candidates) {
+        const parts = candidate.content?.parts || [];
+        for (const part of parts) {
+          if (part.text) {
+            finalMessage += part.text;
+          }
+        }
+
+        // Check for finish reason
+        if (candidate.finishReason && candidate.finishReason !== "STOP") {
+          // Non-normal finish
+        }
+      }
+
+      // Extract usage metadata if present
+      if (chunk.usageMetadata) {
+        // Available for stats but not needed for notification flow
+      }
+    }
+  }
+
+  // Emit final message
+  if (finalMessage) {
+    const itemId = `item-${++itemCounter}`;
+    emit({
+      method: "item/completed",
+      params: {
+        threadId, turnId, itemId,
+        item: { type: "agentMessage", text: finalMessage, phase: "final_answer" }
+      }
+    });
+  }
+
+  // Emit turn/completed
+  emit({
+    method: "turn/completed",
+    params: {
+      threadId, turnId,
+      turn: { id: turnId, status: "completed", stats: {} }
+    }
+  });
+
+  return { status: 0, finalMessage, stderr: "", reasoningSummary: [] };
+}
+
+// ---------------------------------------------------------------------------
+// Gemini CLI spawner (fallback when REST API unavailable)
 // ---------------------------------------------------------------------------
 
 function buildGeminiArgs(prompt, options = {}) {
@@ -661,7 +845,39 @@ export class GeminiAppServer {
       timestamp: new Date().toISOString()
     });
 
-    // Spawn gemini process
+    // Try REST API first (fast path), fall back to CLI spawn
+    const creds = loadGeminiCredentials();
+    const canUseAPI = creds && sandbox !== "workspace-write"; // API can't do file edits
+
+    if (canUseAPI) {
+      // Fast path: direct REST API call
+      const apiPromise = callGeminiAPIStream(fullPrompt, resolvedModel, creds, threadId, turnId, emit)
+        .then((apiResult) => {
+          if (apiResult.finalMessage) {
+            appendHistoryEntry(this.stateDir, threadId, {
+              role: "assistant",
+              content: apiResult.finalMessage,
+              timestamp: new Date().toISOString()
+            });
+          }
+          metadata.updatedAt = new Date().toISOString();
+          writeThreadMetadata(this.stateDir, threadId, metadata);
+        })
+        .catch((apiError) => {
+          // API failed — fall back to CLI spawn
+          this._spawnCliFallback(threadId, turnId, fullPrompt, resolvedModel, sandbox, metadata, emit);
+        });
+
+      return { turn: { id: turnId, status: "inProgress" } };
+    }
+
+    // Slow path: CLI spawn (for write mode or when no credentials)
+    this._spawnCliFallback(threadId, turnId, fullPrompt, resolvedModel, sandbox, metadata, emit);
+    return { turn: { id: turnId, status: "inProgress" } };
+  }
+
+  /** @private CLI spawn fallback — used when REST API is unavailable */
+  _spawnCliFallback(threadId, turnId, fullPrompt, resolvedModel, sandbox, metadata, emit) {
     const proc = spawnGeminiProcess(fullPrompt, {
       cwd: metadata.cwd,
       model: resolvedModel,
@@ -671,7 +887,6 @@ export class GeminiAppServer {
 
     this.activeProcesses.set(threadId, proc);
 
-    // Setup stream translation
     const rl = readline.createInterface({ input: proc.stdout });
     proc.stdout.setEncoding("utf8");
     proc.stderr.setEncoding("utf8");
@@ -683,14 +898,9 @@ export class GeminiAppServer {
 
     const translationPromise = createStreamTranslator(rl, threadId, turnId, emit);
 
-    // Return immediately with turn info — notifications will stream
-    const result = { turn: { id: turnId, status: "inProgress" } };
-
-    // Wait for process to complete in background
     translationPromise.then((translationResult) => {
       this.activeProcesses.delete(threadId);
 
-      // Append assistant response to history
       if (translationResult.finalMessage) {
         appendHistoryEntry(this.stateDir, threadId, {
           role: "assistant",
@@ -699,12 +909,9 @@ export class GeminiAppServer {
         });
       }
 
-      // Update thread metadata
       metadata.updatedAt = new Date().toISOString();
       writeThreadMetadata(this.stateDir, threadId, metadata);
     });
-
-    return result;
   }
 
   async handleTurnInterrupt(params) {
