@@ -1,389 +1,111 @@
-# Agent Plugin for Claude Code
+# Gemini Plugin for Claude Code
 
-Use **Codex** and **Gemini CLI** from inside Claude Code for code reviews, task delegation, and Q&A.
+Google Gemini CLI를 Claude Code 안에서 사용할 수 있는 플러그인입니다.
+코드 리뷰, 작업 위임, 질의응답을 Gemini에 맡길 수 있습니다.
 
-This is a multi-agent plugin marketplace. Claude Code users can install either or both plugins to delegate work to OpenAI Codex or Google Gemini from within their existing workflow.
+## 커맨드
 
-## Plugins
+| 커맨드 | 설명 |
+|--------|------|
+| `/gemini:ask` | Gemini에게 질문 (경량 직접 호출) |
+| `/gemini:review` | 코드 리뷰 |
+| `/gemini:adversarial-review` | 공격적 설계 리뷰 |
+| `/gemini:rescue` | 작업 위임 (버그 조사, 수정 등) |
+| `/gemini:status` | 백그라운드 작업 상태 확인 |
+| `/gemini:result` | 완료된 작업 결과 조회 |
+| `/gemini:cancel` | 실행 중인 작업 취소 |
+| `/gemini:setup` | 설치 상태 및 인증 확인 |
 
-| Plugin | Description | Provider |
-|--------|-------------|----------|
-| **codex** | Code review & task delegation via OpenAI Codex | OpenAI |
-| **gemini** | Code review, task delegation & Q&A via Google Gemini CLI | Community |
+## 요구사항
 
----
+- **Gemini CLI** (`npm install -g @google/gemini-cli`)
+- **인증** — 아래 중 하나:
+  - Google OAuth (`gemini` 실행 후 브라우저 로그인)
+  - `GEMINI_API_KEY` 환경변수
+  - Vertex AI (`GOOGLE_API_KEY` + `GOOGLE_GENAI_USE_VERTEXAI=true`)
+- **Node.js 18.18 이상**
 
-## Gemini Plugin
+## 설치
 
-### What You Get
+Claude Code에서:
 
-- `/gemini:ask` to ask Gemini a question (read-only)
-- `/gemini:review` for a Gemini code review
-- `/gemini:adversarial-review` for a steerable challenge review
-- `/gemini:rescue`, `/gemini:status`, `/gemini:result`, and `/gemini:cancel` to delegate work and manage background jobs
-
-### Requirements
-
-- **Google Gemini CLI** installed (`npm install -g @google/gemini-cli`)
-- **Authentication** — one of:
-  - Google OAuth (run `gemini` for browser-based login)
-  - `GEMINI_API_KEY` environment variable
-  - `GOOGLE_API_KEY` + Vertex AI configuration
-- **Node.js 18.18 or later**
-
-### Install
-
-Add the marketplace in Claude Code:
-
-```bash
+```
 /plugin marketplace add amurtare/agent_plugin
-```
-
-Install the plugin:
-
-```bash
 /plugin install gemini@agent-plugin
-```
-
-Reload plugins:
-
-```bash
 /reload-plugins
-```
-
-Then run:
-
-```bash
 /gemini:setup
 ```
 
-`/gemini:setup` will tell you whether Gemini CLI is ready and authenticated.
+## 사용법
 
-If you prefer to install Gemini CLI yourself:
+### 질문하기
 
-```bash
-npm install -g @google/gemini-cli
+```
+/gemini:ask 이 프로젝트의 아키텍처를 설명해줘
+/gemini:ask React와 Vue 중 뭐가 나아?
 ```
 
-After install, you should see:
+### 코드 리뷰
 
-- the slash commands listed below
-- the `gemini:gemini-rescue` subagent in `/agents`
-
-One simple first run is:
-
-```bash
-/gemini:ask explain the architecture of this project
 ```
-
-### Usage
-
-#### `/gemini:ask`
-
-Ask Gemini a question in read-only mode. Gemini will not make any file changes.
-
-Examples:
-
-```bash
-/gemini:ask explain the architecture of this project
-/gemini:ask what does the handleAuth function do?
-/gemini:ask compare React and Vue for this use case
-```
-
-#### `/gemini:review`
-
-Runs a Gemini review on your current work.
-
-> **Note:** Code review especially for multi-file changes might take a while. It's generally recommended to run it in the background.
-
-Use it when you want:
-
-- a review of your current uncommitted changes
-- a review of your branch compared to a base branch like `main`
-
-Use `--base <ref>` for branch review. It also supports `--wait` and `--background`.
-
-Examples:
-
-```bash
 /gemini:review
 /gemini:review --base main
 /gemini:review --background
 ```
 
-This command is read-only and will not perform any changes.
+### 설계 리뷰
 
-#### `/gemini:adversarial-review`
-
-Runs a **steerable** review that challenges the chosen implementation and design.
-
-Use it when you want:
-
-- a review before shipping that challenges the direction, not just the code details
-- pressure-testing around specific risk areas like auth, data loss, rollback, race conditions, or reliability
-
-Examples:
-
-```bash
+```
 /gemini:adversarial-review
-/gemini:adversarial-review --base main challenge whether this was the right caching design
-/gemini:adversarial-review --background look for race conditions
+/gemini:adversarial-review --base main 캐싱 설계가 맞는지 검토해줘
 ```
 
-This command is read-only. It does not fix code.
+### 작업 위임
 
-#### `/gemini:rescue`
-
-Hands a task to Gemini through the `gemini:gemini-rescue` subagent.
-
-Use it when you want Gemini to:
-
-- investigate a bug
-- try a fix
-- continue a previous Gemini task
-
-It supports `--background`, `--wait`, `--resume`, and `--fresh`.
-
-Examples:
-
-```bash
-/gemini:rescue investigate why the tests started failing
-/gemini:rescue fix the failing test with the smallest safe patch
-/gemini:rescue --resume apply the top fix from the last run
-/gemini:rescue --model gemini-2.5-flash investigate the flaky test
-/gemini:rescue --background investigate the regression
+```
+/gemini:rescue 테스트가 왜 실패하는지 조사해줘
+/gemini:rescue 실패하는 테스트를 최소한의 패치로 수정해줘
+/gemini:rescue --model gemini-2.5-flash 빠르게 확인해줘
+/gemini:rescue --background 회귀 조사해줘
 ```
 
-You can also just ask for a task to be delegated to Gemini:
+### 작업 관리
 
-```text
-Ask Gemini to redesign the database connection to be more resilient.
 ```
-
-**Notes:**
-
-- Model aliases: `flash` maps to `gemini-2.5-flash`, `pro` maps to `gemini-2.5-pro`
-- Follow-up rescue requests can continue the latest Gemini task in the repo
-
-#### `/gemini:status`
-
-Shows running and recent Gemini jobs for the current repository.
-
-```bash
 /gemini:status
-/gemini:status task-abc123
-```
-
-#### `/gemini:result`
-
-Shows the final stored Gemini output for a finished job.
-
-```bash
 /gemini:result
-/gemini:result task-abc123
-```
-
-#### `/gemini:cancel`
-
-Cancels an active background Gemini job.
-
-```bash
-/gemini:cancel
 /gemini:cancel task-abc123
 ```
 
-#### `/gemini:setup`
+## 인증 방법
 
-Checks whether Gemini CLI is installed and authenticated. Supports the optional review gate:
-
-```bash
-/gemini:setup --enable-review-gate
-/gemini:setup --disable-review-gate
-```
-
-> **Warning:** The review gate can create a long-running Claude/Gemini loop and may drain usage limits quickly. Only enable it when you plan to actively monitor the session.
-
-### Gemini Integration
-
-The Gemini plugin wraps the [Gemini CLI](https://github.com/google-gemini/gemini-cli) through a custom App Server that manages threads and streams results via JSON-RPC.
-
-Unlike Codex which has a built-in app server daemon, the Gemini plugin runs its own server that:
-
-- Spawns `gemini -p` with `--output-format stream-json` for each turn
-- Manages conversation history across turns (with context summarization for long sessions)
-- Translates Gemini's streaming JSONL events into the JSON-RPC notification protocol
-
-### Authentication Methods
-
-| Method | Setup |
-|--------|-------|
-| Google OAuth (free tier) | Run `gemini` and sign in via browser |
+| 방법 | 설정 |
+|------|------|
+| Google OAuth (무료) | `gemini` 실행 후 브라우저 로그인 |
 | API Key | `export GEMINI_API_KEY="your-key"` |
-| Vertex AI (enterprise) | `export GOOGLE_API_KEY="your-key"` + `GOOGLE_GENAI_USE_VERTEXAI=true` |
+| Vertex AI (엔터프라이즈) | `export GOOGLE_API_KEY="your-key"` + `GOOGLE_GENAI_USE_VERTEXAI=true` |
 
----
+## 아키텍처
 
-## Codex Plugin
+플러그인은 자체 App Server 데몬을 통해 Gemini CLI와 통신합니다:
 
-### What You Get
-
-- `/codex:review` for a normal read-only Codex review
-- `/codex:adversarial-review` for a steerable challenge review
-- `/codex:rescue`, `/codex:status`, `/codex:result`, and `/codex:cancel` to delegate work and manage background jobs
-
-### Requirements
-
-- **ChatGPT subscription (incl. Free) or OpenAI API key.**
-  - Usage will contribute to your Codex usage limits. [Learn more](https://developers.openai.com/codex/pricing).
-- **Node.js 18.18 or later**
-
-### Install
-
-Add the marketplace in Claude Code:
-
-```bash
-/plugin marketplace add amurtare/agent_plugin
-```
-
-Install the plugin:
-
-```bash
-/plugin install codex@agent-plugin
-```
-
-Reload plugins:
-
-```bash
-/reload-plugins
-```
-
-Then run:
-
-```bash
-/codex:setup
-```
-
-If Codex is missing and npm is available, it can offer to install Codex for you:
-
-```bash
-npm install -g @openai/codex
-```
-
-If Codex is installed but not logged in:
-
-```bash
-!codex login
-```
-
-### Usage
-
-#### `/codex:review`
-
-Runs a normal Codex review on your current work.
-
-```bash
-/codex:review
-/codex:review --base main
-/codex:review --background
-```
-
-#### `/codex:adversarial-review`
-
-Runs a steerable review that challenges the implementation.
-
-```bash
-/codex:adversarial-review
-/codex:adversarial-review --base main challenge whether this was the right caching design
-```
-
-#### `/codex:rescue`
-
-Hands a task to Codex through the `codex:codex-rescue` subagent.
-
-```bash
-/codex:rescue investigate why the tests started failing
-/codex:rescue --model spark fix the issue quickly
-/codex:rescue --background investigate the regression
-```
-
-#### `/codex:status`, `/codex:result`, `/codex:cancel`
-
-Manage background Codex jobs.
-
-```bash
-/codex:status
-/codex:result
-/codex:cancel task-abc123
-```
-
-#### `/codex:setup`
-
-Checks whether Codex is installed and authenticated.
-
-```bash
-/codex:setup --enable-review-gate
-/codex:setup --disable-review-gate
-```
-
-### Codex Integration
-
-The Codex plugin wraps the [Codex app server](https://developers.openai.com/codex/app-server). It uses the global `codex` binary installed in your environment and [applies the same configuration](https://developers.openai.com/codex/config-basic).
-
----
-
-## Typical Flows
-
-### Ask Gemini a Question
-
-```bash
-/gemini:ask what is the best way to handle auth in this codebase?
-```
-
-### Review Before Shipping
-
-```bash
-/gemini:review
-/codex:review
-```
-
-### Hand A Problem To An Agent
-
-```bash
-/gemini:rescue investigate why the build is failing in CI
-/codex:rescue investigate why the build is failing in CI
-```
-
-### Start Something Long-Running
-
-```bash
-/gemini:adversarial-review --background
-/gemini:rescue --background investigate the flaky test
-```
-
-Then check in with:
-
-```bash
-/gemini:status
-/gemini:result
-```
-
----
+- `gemini -p` + `--output-format stream-json`으로 각 턴 실행
+- 대화 히스토리를 디스크에 저장하여 세션 이어가기 지원
+- Gemini의 JSONL 스트림을 JSON-RPC 알림으로 변환
+- `/gemini:ask`는 경량 직접 호출로 브로커/데몬 스택 우회
 
 ## FAQ
 
-### Can I use both plugins at the same time?
+### Gemini CLI 인증이 안 되어 있으면?
 
-Yes. Codex and Gemini plugins are independent. Install both and use whichever fits the task.
+`/gemini:setup`을 실행하면 상태를 확인할 수 있습니다.
+Google OAuth, API Key, Vertex AI 중 하나로 인증하세요.
 
-### Do I need separate accounts?
+### Review Gate란?
 
-- **Codex**: Uses your local Codex CLI authentication (ChatGPT account or API key)
-- **Gemini**: Uses your local Gemini CLI authentication (Google OAuth or API key)
+`/gemini:setup --enable-review-gate`로 활성화하면, Claude가 응답을 완료하기 전에 Gemini가 코드 리뷰를 수행합니다.
+리소스를 많이 소모하므로 세션을 모니터링할 때만 사용하세요.
 
-### Does the Gemini plugin use a daemon like Codex?
-
-Codex has a built-in `codex app-server` daemon. The Gemini plugin includes its own lightweight App Server that wraps `gemini -p` CLI calls behind the same JSON-RPC protocol. It is started automatically when needed and cleaned up on session end.
-
-## License
+## 라이선스
 
 Apache-2.0

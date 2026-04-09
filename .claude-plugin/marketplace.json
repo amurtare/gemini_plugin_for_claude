@@ -4,25 +4,16 @@
     "name": "amurtare"
   },
   "metadata": {
-    "description": "Multi-agent plugins for Claude Code — delegate tasks to Codex or Gemini CLI.",
-    "version": "1.0.2"
+    "description": "Gemini CLI plugin for Claude Code — delegate tasks, review code, and ask questions.",
+    "version": "0.2.0"
   },
   "plugins": [
-    {
-      "name": "codex",
-      "description": "Use Codex from Claude Code to review code or delegate tasks.",
-      "version": "1.0.2",
-      "author": {
-        "name": "OpenAI"
-      },
-      "source": "./plugins/codex"
-    },
     {
       "name": "gemini",
       "description": "Use Google Gemini CLI from Claude Code to review code or delegate tasks.",
       "version": "0.1.0",
       "author": {
-        "name": "Community"
+        "name": "amurtare"
       },
       "source": "./plugins/gemini"
     }
