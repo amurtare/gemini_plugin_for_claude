@@ -5,6 +5,9 @@
  * getGeminiAuthStatus, interruptGeminiTurn, findLatestTaskThread.
  */
 
+import fs from "node:fs";
+import path from "node:path";
+
 import { readJsonFile, binaryAvailable } from "./shared.mjs";
 import { BROKER_ENDPOINT_ENV, BROKER_BUSY_RPC_CODE, GeminiAppServerClient } from "./gemini-app-server.mjs";
 import { loadBrokerSession } from "./broker-lifecycle.mjs";
@@ -83,12 +86,33 @@ export async function getGeminiAuthStatus(cwd) {
     };
   }
 
-  // Check Google OAuth — try running gemini with a quick check
-  // For now, assume not logged in if no API key
+  // Check Google OAuth credentials on disk
+  const homeDir = process.env.HOME || process.env.USERPROFILE || "";
+  if (homeDir) {
+    const oauthCredsPath = path.join(homeDir, ".gemini", "oauth_creds.json");
+    try {
+      const stats = fs.statSync(oauthCredsPath);
+      if (stats.isFile() && stats.size > 2) {
+        return {
+          available: true,
+          loggedIn: true,
+          detail: "Authenticated via Google OAuth.",
+          source: "oauth",
+          authMethod: "google-oauth",
+          verified: null,
+          requiresGoogleAuth: false,
+          provider: "google"
+        };
+      }
+    } catch {
+      // File doesn't exist — not authenticated via OAuth
+    }
+  }
+
   return {
     available: true,
     loggedIn: false,
-    detail: "No GEMINI_API_KEY or GOOGLE_API_KEY found. Run `gemini` to authenticate via Google OAuth, or set GEMINI_API_KEY.",
+    detail: "No GEMINI_API_KEY or GOOGLE_API_KEY found and no OAuth credentials detected. Run `gemini` to authenticate via Google OAuth, or set GEMINI_API_KEY.",
     source: "unknown",
     authMethod: null,
     verified: null,
