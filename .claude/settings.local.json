@@ -38,7 +38,11 @@
       "Bash(rm -f tests/fake-codex-fixture.mjs)",
       "Bash(rm -f .github/workflows/pull-request-ci.yml)",
       "Bash(rmdir .github/workflows)",
-      "Bash(rmdir .github)"
+      "Bash(rmdir .github)",
+      "Bash(gh repo:*)",
+      "Bash(git ls-remote:*)",
+      "Bash(gemini --version)",
+      "Bash(gemini --help)"
     ]
   }
 }

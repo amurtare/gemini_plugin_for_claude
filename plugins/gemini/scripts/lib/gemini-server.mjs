@@ -12,6 +12,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import readline from "node:readline";
+import { createSession, resumeSession, isAlive } from "./acp-lifecycle.mjs";
 
 const MAX_HISTORY_CHARS = 100_000;
 const MAX_HISTORY_ENTRIES = 500;
@@ -713,6 +714,10 @@ export class GeminiAppServer {
     /** @type {Map<string, import("child_process").ChildProcess>} threadId → running gemini process */
     this.activeProcesses = new Map();
     this.initialized = false;
+    /** @type {import("./acp-client.mjs").AcpClient | null} */
+    this.acpClient = null;
+    this.acpSessionId = null;
+    this.acpReady = false;
   }
 
   /**
@@ -845,38 +850,127 @@ export class GeminiAppServer {
       timestamp: new Date().toISOString()
     });
 
-    // Try REST API first (fast path), fall back to CLI spawn
-    const creds = loadGeminiCredentials();
-    const canUseAPI = creds && sandbox !== "workspace-write"; // API can't do file edits
+    // Priority: ACP (persistent, fast) → CLI spawn (fallback)
+    this._acpTurn(threadId, turnId, userText, resolvedModel, sandbox, metadata, emit)
+      .catch(() => {
+        // ACP failed — fall back to CLI spawn
+        this._spawnCliFallback(threadId, turnId, fullPrompt, resolvedModel, sandbox, metadata, emit);
+      });
 
-    if (canUseAPI) {
-      // Fast path: direct REST API call
-      const apiPromise = callGeminiAPIStream(fullPrompt, resolvedModel, creds, threadId, turnId, emit)
-        .then((apiResult) => {
-          if (apiResult.finalMessage) {
-            appendHistoryEntry(this.stateDir, threadId, {
-              role: "assistant",
-              content: apiResult.finalMessage,
-              timestamp: new Date().toISOString()
-            });
-          }
-          metadata.updatedAt = new Date().toISOString();
-          writeThreadMetadata(this.stateDir, threadId, metadata);
-        })
-        .catch((apiError) => {
-          // API failed — fall back to CLI spawn
-          this._spawnCliFallback(threadId, turnId, fullPrompt, resolvedModel, sandbox, metadata, emit);
-        });
-
-      return { turn: { id: turnId, status: "inProgress" } };
-    }
-
-    // Slow path: CLI spawn (for write mode or when no credentials)
-    this._spawnCliFallback(threadId, turnId, fullPrompt, resolvedModel, sandbox, metadata, emit);
     return { turn: { id: turnId, status: "inProgress" } };
   }
 
-  /** @private CLI spawn fallback — used when REST API is unavailable */
+  /** @private ACP turn — persistent process, fast path */
+  async _acpTurn(threadId, turnId, userText, resolvedModel, sandbox, metadata, emit) {
+    // Ensure ACP client is alive
+    if (!this.acpClient || !isAlive(this.acpClient)) {
+      const { client, sessionId } = await createSession({
+        cwd: metadata.cwd,
+        model: resolvedModel,
+        env: this.options.env
+      });
+      this.acpClient = client;
+      this.acpSessionId = sessionId;
+      this.acpReady = true;
+
+      // Allow file operations only in write mode
+      if (sandbox === "workspace-write") {
+        client.onServerRequest("read_text_file", (params) => {
+          try {
+            const content = fs.readFileSync(params.path, "utf8");
+            return { content };
+          } catch (err) {
+            return { content: "", error: err.message };
+          }
+        });
+        client.onServerRequest("write_text_file", (params) => {
+          try {
+            fs.writeFileSync(params.path, params.content, "utf8");
+            return {};
+          } catch (err) {
+            return { error: err.message };
+          }
+        });
+      }
+    }
+
+    // Switch model if needed
+    if (resolvedModel && this.acpClient) {
+      try {
+        await this.acpClient.setModel(this.acpSessionId, resolvedModel);
+      } catch {
+        // Model switch not critical — continue with default
+      }
+    }
+
+    // Emit turn/started
+    emit({
+      method: "turn/started",
+      params: { threadId, turnId, turn: { id: turnId, status: "inProgress" } }
+    });
+
+    // Collect response via update handler
+    let finalMessage = "";
+    const updateHandler = (msg) => {
+      if (msg.method === "session/update" && msg.params) {
+        const text = msg.params.text || msg.params.content || msg.params.message || "";
+        if (text) finalMessage += text;
+      }
+    };
+    this.acpClient.onUpdate(updateHandler);
+
+    try {
+      // Send prompt
+      const result = await this.acpClient.prompt(
+        this.acpSessionId,
+        [{ type: "text", text: userText }]
+      );
+
+      // Extract response from result
+      if (!finalMessage) {
+        finalMessage = result?.text || result?.content || result?.message || "";
+        if (typeof result === "string") finalMessage = result;
+      }
+
+      // Emit final message
+      if (finalMessage) {
+        emit({
+          method: "item/completed",
+          params: {
+            threadId, turnId, itemId: `item-1`,
+            item: { type: "agentMessage", text: finalMessage, phase: "final_answer" }
+          }
+        });
+      }
+
+      // Emit turn/completed
+      emit({
+        method: "turn/completed",
+        params: { threadId, turnId, turn: { id: turnId, status: "completed", stats: {} } }
+      });
+
+      // Persist history
+      if (finalMessage) {
+        appendHistoryEntry(this.stateDir, threadId, {
+          role: "assistant",
+          content: finalMessage,
+          timestamp: new Date().toISOString()
+        });
+      }
+      metadata.updatedAt = new Date().toISOString();
+      writeThreadMetadata(this.stateDir, threadId, metadata);
+
+    } catch (error) {
+      // Emit error and let caller fall back to CLI spawn
+      emit({
+        method: "turn/completed",
+        params: { threadId, turnId, turn: { id: turnId, status: "failed" } }
+      });
+      throw error;
+    }
+  }
+
+  /** @private CLI spawn fallback — used when ACP is unavailable */
   _spawnCliFallback(threadId, turnId, fullPrompt, resolvedModel, sandbox, metadata, emit) {
     const proc = spawnGeminiProcess(fullPrompt, {
       cwd: metadata.cwd,
@@ -964,6 +1058,15 @@ export class GeminiAppServer {
   }
 
   shutdown() {
+    // Shutdown ACP client
+    if (this.acpClient) {
+      this.acpClient.shutdown().catch(() => {});
+      this.acpClient = null;
+      this.acpSessionId = null;
+      this.acpReady = false;
+    }
+
+    // Kill any active CLI spawn processes
     for (const [threadId, proc] of this.activeProcesses) {
       try {
         if (process.platform === "win32") {

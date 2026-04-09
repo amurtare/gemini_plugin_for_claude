@@ -69,7 +69,9 @@ const DEFAULT_STATUS_POLL_INTERVAL_MS = 2000;
 const VALID_REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh"]);
 const MODEL_ALIASES = new Map([
   ["flash", "gemini-2.5-flash"],
-  ["pro", "gemini-2.5-pro"]
+  ["pro", "gemini-2.5-pro"],
+  ["flash-3", "gemini-2.5-flash-preview-04-17"],
+  ["pro-3", "gemini-2.5-pro-preview-03-25"]
 ]);
 const STOP_REVIEW_TASK_MARKER = "Run a stop-gate review of the previous Claude turn.";
 
