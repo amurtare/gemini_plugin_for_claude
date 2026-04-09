@@ -1,95 +1,37 @@
 #!/usr/bin/env node
 
 /**
- * Lightweight direct Gemini API caller for /gemini:ask.
+ * Lightweight direct Gemini CLI caller for /gemini:ask.
  * Bypasses the full broker/daemon/thread stack for simple Q&A.
+ * Spawns gemini -p directly and prints the response text.
  *
  * Usage: node gemini-ask-direct.mjs [--model <model>] <prompt>
  */
 
 import fs from "node:fs";
 import path from "node:path";
+import { spawn } from "node:child_process";
 import process from "node:process";
 
-const GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta";
 const DEFAULT_MODEL = "gemini-2.5-flash";
-const TOKEN_EXPIRY_BUFFER_MS = 60_000;
 
-// ---------------------------------------------------------------------------
-// Credentials
-// ---------------------------------------------------------------------------
-
-function loadCredentials() {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (apiKey) return { type: "api-key", key: apiKey };
-
-  const homeDir = process.env.HOME || process.env.USERPROFILE || "";
-  if (!homeDir) return null;
-
-  try {
-    const raw = fs.readFileSync(path.join(homeDir, ".gemini", "oauth_creds.json"), "utf8");
-    const creds = JSON.parse(raw);
-    if (!creds.access_token) return null;
-    if (creds.expiry_date && Date.now() >= creds.expiry_date - TOKEN_EXPIRY_BUFFER_MS) return null;
-    return { type: "oauth", accessToken: creds.access_token };
-  } catch {
-    return null;
+function resolveGeminiBinary() {
+  if (process.platform === "win32") {
+    const npmGlobal = process.env.APPDATA
+      ? path.join(process.env.APPDATA, "npm", "node_modules", "@google", "gemini-cli", "bundle", "gemini.js")
+      : null;
+    if (npmGlobal && fs.existsSync(npmGlobal)) {
+      return { binary: process.execPath, prefix: [npmGlobal] };
+    }
+    // Fallback to shell
+    return { binary: "gemini", prefix: [], shell: true };
   }
+  return { binary: "gemini", prefix: [], shell: false };
 }
-
-// ---------------------------------------------------------------------------
-// API call
-// ---------------------------------------------------------------------------
-
-async function callGemini(prompt, model) {
-  const creds = loadCredentials();
-  if (!creds) {
-    throw new Error("No valid Gemini credentials. Set GEMINI_API_KEY or run `gemini` to authenticate.");
-  }
-
-  const modelId = model || DEFAULT_MODEL;
-  let url = `${GEMINI_API_BASE}/models/${modelId}:generateContent`;
-  const headers = { "Content-Type": "application/json" };
-
-  if (creds.type === "api-key") {
-    url += `?key=${encodeURIComponent(creds.key)}`;
-  } else {
-    headers["Authorization"] = `Bearer ${creds.accessToken}`;
-  }
-
-  const project = process.env.GOOGLE_CLOUD_PROJECT || process.env.GOOGLE_CLOUD_PROJECT_ID;
-  if (project) {
-    headers["x-goog-user-project"] = project;
-  }
-
-  const response = await fetch(url, {
-    method: "POST",
-    headers,
-    body: JSON.stringify({
-      contents: [{ parts: [{ text: prompt }] }]
-    })
-  });
-
-  if (!response.ok) {
-    const errorText = await response.text().catch(() => "");
-    throw new Error(`Gemini API ${response.status}: ${errorText}`);
-  }
-
-  const data = await response.json();
-  const text = data.candidates?.[0]?.content?.parts
-    ?.map((p) => p.text)
-    .join("") || "";
-
-  return text;
-}
-
-// ---------------------------------------------------------------------------
-// Main
-// ---------------------------------------------------------------------------
 
 async function main() {
   const args = process.argv.slice(2);
-  let model = null;
+  let model = DEFAULT_MODEL;
   const promptParts = [];
 
   for (let i = 0; i < args.length; i++) {
@@ -107,8 +49,50 @@ async function main() {
     return;
   }
 
-  const result = await callGemini(prompt, model);
-  process.stdout.write(result);
+  const { binary, prefix, shell } = resolveGeminiBinary();
+  const geminiArgs = [...prefix, "-p", prompt, "-m", model, "--output-format", "json"];
+
+  const proc = spawn(binary, geminiArgs, {
+    cwd: process.cwd(),
+    env: process.env,
+    stdio: ["pipe", "pipe", "pipe"],
+    shell: shell || false,
+    windowsHide: true
+  });
+
+  let stdout = "";
+  let stderr = "";
+
+  proc.stdout.on("data", (chunk) => { stdout += chunk; });
+  proc.stderr.on("data", (chunk) => { stderr += chunk; });
+
+  const exitCode = await new Promise((resolve) => {
+    proc.on("error", (err) => {
+      process.stderr.write(`Failed to start gemini: ${err.message}\n`);
+      resolve(1);
+    });
+    proc.on("exit", (code) => resolve(code ?? 1));
+  });
+
+  if (exitCode !== 0) {
+    // Filter noise from stderr
+    const cleanStderr = stderr.split("\n")
+      .filter((l) => l.trim() && !l.includes("DEP0190") && !l.includes("DeprecationWarning"))
+      .join("\n");
+    if (cleanStderr) process.stderr.write(cleanStderr + "\n");
+    process.exitCode = exitCode;
+    return;
+  }
+
+  // Parse JSON output and extract response text
+  try {
+    const data = JSON.parse(stdout);
+    const responseText = data.response || stdout;
+    process.stdout.write(responseText);
+  } catch {
+    // Not JSON — print as-is
+    process.stdout.write(stdout);
+  }
 }
 
 main().catch((error) => {
