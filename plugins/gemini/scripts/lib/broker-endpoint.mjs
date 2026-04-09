@@ -10,7 +10,7 @@ function sanitizePipeName(value) {
 export function createBrokerEndpoint(sessionDir, platform = process.platform) {
   if (platform === "win32") {
     const pipeName = sanitizePipeName(`${path.win32.basename(sessionDir)}-gemini-app-server`);
-    return `pipe:\\\\.\\pipe\\${pipeName}`;
+    return `pipe://./pipe/${pipeName}`;
   }
 
   return `unix:${path.join(sessionDir, "broker.sock")}`;
@@ -26,7 +26,8 @@ export function parseBrokerEndpoint(endpoint) {
     if (!pipePath) {
       throw new Error("Broker pipe endpoint is missing its path.");
     }
-    return { kind: "pipe", path: pipePath };
+    // Normalize backslashes to forward slashes for Windows named pipes
+    return { kind: "pipe", path: pipePath.replace(/\\/g, "/") };
   }
 
   if (endpoint.startsWith("unix:")) {

@@ -208,21 +208,24 @@ function buildSafeEnv(extraEnv = {}) {
     USERPROFILE: process.env.USERPROFILE,
     HOMEDRIVE: process.env.HOMEDRIVE,
     HOMEPATH: process.env.HOMEPATH,
+    APPDATA: process.env.APPDATA,
+    LOCALAPPDATA: process.env.LOCALAPPDATA,
     TMPDIR: process.env.TMPDIR,
     TEMP: process.env.TEMP,
     TMP: process.env.TMP,
     LANG: process.env.LANG,
-    // Gemini auth
-    GEMINI_API_KEY: process.env.GEMINI_API_KEY,
-    GOOGLE_API_KEY: process.env.GOOGLE_API_KEY,
-    GOOGLE_CLOUD_PROJECT: process.env.GOOGLE_CLOUD_PROJECT,
-    GOOGLE_CLOUD_LOCATION: process.env.GOOGLE_CLOUD_LOCATION,
-    GOOGLE_APPLICATION_CREDENTIALS: process.env.GOOGLE_APPLICATION_CREDENTIALS,
-    GOOGLE_GENAI_USE_VERTEXAI: process.env.GOOGLE_GENAI_USE_VERTEXAI,
     // Display
     NO_COLOR: "1",
     ...extraEnv
   };
+
+  // Pass through all GOOGLE_* and GEMINI_* env vars for auth/config
+  for (const [key, value] of Object.entries(process.env)) {
+    if ((key.startsWith("GOOGLE_") || key.startsWith("GEMINI_")) && value) {
+      safe[key] = value;
+    }
+  }
+
   // Remove undefined values
   for (const key of Object.keys(safe)) {
     if (safe[key] === undefined) delete safe[key];
@@ -234,11 +237,37 @@ function spawnGeminiProcess(prompt, options = {}) {
   const args = buildGeminiArgs(prompt, options);
   const env = buildSafeEnv(options.env);
 
-  const proc = spawn("gemini", args, {
+  // On Windows, npm-installed CLIs are .cmd wrappers that require shell.
+  // We use process.execPath (node) to run the actual JS entry point directly,
+  // which avoids both shell:true security issues and .cmd limitations.
+  let binary = "gemini";
+  let spawnArgs = args;
+  let useShell = false;
+
+  if (process.platform === "win32") {
+    // Find the actual JS entry point behind gemini.cmd
+    const npmGlobalDir = process.env.APPDATA
+      ? path.join(process.env.APPDATA, "npm")
+      : null;
+    const geminiJsPath = npmGlobalDir
+      ? path.join(npmGlobalDir, "node_modules", "@google", "gemini-cli", "bundle", "gemini.js")
+      : null;
+
+    if (geminiJsPath && fs.existsSync(geminiJsPath)) {
+      // Spawn node directly with the CLI entry point
+      binary = process.execPath;
+      spawnArgs = [geminiJsPath, ...args];
+    } else {
+      // Fallback: use gemini.cmd with shell (less ideal but works)
+      useShell = true;
+    }
+  }
+
+  const proc = spawn(binary, spawnArgs, {
     cwd: options.cwd || process.cwd(),
     env,
     stdio: ["pipe", "pipe", "pipe"],
-    shell: false,
+    shell: useShell,
     windowsHide: true
   });
 

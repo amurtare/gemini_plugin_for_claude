@@ -55,7 +55,8 @@ function writePidFile(pidFile) {
 
 function parseBrokerEndpoint(endpoint) {
   if (endpoint.startsWith("pipe:")) {
-    return { kind: "pipe", path: endpoint.slice(5) };
+    // Normalize backslashes to forward slashes for Windows named pipes
+    return { kind: "pipe", path: endpoint.slice(5).replace(/\\/g, "/") };
   }
   if (endpoint.startsWith("unix:")) {
     return { kind: "unix", path: endpoint.slice(5) };
