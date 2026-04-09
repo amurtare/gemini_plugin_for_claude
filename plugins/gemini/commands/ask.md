@@ -14,10 +14,9 @@ If the user did not provide a question, use `AskUserQuestion` to ask what they w
 
 Run:
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/scripts/gemini-companion.mjs" task --json "$ARGUMENTS"
+node "${CLAUDE_PLUGIN_ROOT}/scripts/gemini-companion.mjs" task "$ARGUMENTS"
 ```
 
 Note: Do NOT add `--write`. This command is read-only by design.
 
-Return the command stdout verbatim, exactly as-is.
-Do not paraphrase, summarize, or add commentary before or after it.
+Present only Gemini's response text to the user. Do not include job metadata, thread IDs, status codes, or JSON structure.
