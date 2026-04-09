@@ -1,6 +1,6 @@
 /**
- * Re-exports from Codex plugin's generic library modules.
- * These modules are 100% reusable and contain no Codex-specific logic.
+ * Re-exports from local copies of generic library modules.
+ * These files are copied from the Codex plugin and contain no Codex-specific logic.
  */
 
 // State persistence
@@ -20,7 +20,7 @@ export {
   getConfig,
   generateJobId,
   listJobs
-} from "../../../codex/scripts/lib/state.mjs";
+} from "./state.mjs";
 
 // Job control
 export {
@@ -30,7 +30,7 @@ export {
   resolveCancelableJob,
   resolveResultJob,
   sortJobsNewestFirst
-} from "../../../codex/scripts/lib/job-control.mjs";
+} from "./job-control.mjs";
 
 // Tracked jobs & progress
 export {
@@ -42,45 +42,45 @@ export {
   nowIso,
   runTrackedJob,
   SESSION_ID_ENV
-} from "../../../codex/scripts/lib/tracked-jobs.mjs";
+} from "./tracked-jobs.mjs";
 
 // Git utilities
 export {
   collectReviewContext,
   ensureGitRepository,
   resolveReviewTarget
-} from "../../../codex/scripts/lib/git.mjs";
+} from "./git.mjs";
 
 // Process utilities
 export {
   binaryAvailable,
   terminateProcessTree
-} from "../../../codex/scripts/lib/process.mjs";
+} from "./process.mjs";
 
 // File system utilities
 export {
   readJsonFile,
   readStdinIfPiped
-} from "../../../codex/scripts/lib/fs.mjs";
+} from "./fs.mjs";
 
 // Argument parsing
 export {
   parseArgs,
   splitRawArgumentString
-} from "../../../codex/scripts/lib/args.mjs";
+} from "./args.mjs";
 
 // Workspace resolution
 export {
   resolveWorkspaceRoot
-} from "../../../codex/scripts/lib/workspace.mjs";
+} from "./workspace.mjs";
 
 // Prompt template utilities
 export {
   loadPromptTemplate,
   interpolateTemplate
-} from "../../../codex/scripts/lib/prompts.mjs";
+} from "./prompts.mjs";
 
-// Render utilities (will be wrapped with Gemini branding in gemini-render.mjs)
+// Render utilities
 export {
   renderReviewResult,
   renderStoredJobResult,
@@ -90,4 +90,4 @@ export {
   renderStatusReport,
   renderTaskResult,
   renderNativeReviewResult
-} from "../../../codex/scripts/lib/render.mjs";
+} from "./render.mjs";
