@@ -280,7 +280,16 @@ async function main() {
     process.exit(0);
   });
 
-  server.listen(listenTarget.path);
+  server.listen(listenTarget.path, () => {
+    // Restrict socket file permissions to owner-only (Unix)
+    if (listenTarget.kind === "unix") {
+      try {
+        fs.chmodSync(listenTarget.path, 0o600);
+      } catch {
+        // Best-effort — Windows named pipes don't use chmod
+      }
+    }
+  });
 }
 
 main().catch((error) => {

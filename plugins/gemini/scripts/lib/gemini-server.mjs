@@ -14,6 +14,21 @@ import { spawn } from "node:child_process";
 import readline from "node:readline";
 
 const MAX_HISTORY_CHARS = 100_000;
+const MAX_HISTORY_ENTRIES = 500;
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// ---------------------------------------------------------------------------
+// Security helpers
+// ---------------------------------------------------------------------------
+
+function validateThreadId(threadId) {
+  if (!threadId || !UUID_RE.test(threadId)) {
+    throw Object.assign(
+      new Error(`Invalid thread ID format: ${threadId}`),
+      { code: -32602 }
+    );
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Thread persistence
@@ -24,6 +39,7 @@ function resolveThreadsDir(stateDir) {
 }
 
 function resolveThreadDir(stateDir, threadId) {
+  validateThreadId(threadId);
   return path.join(resolveThreadsDir(stateDir), threadId);
 }
 
@@ -45,7 +61,24 @@ function writeThreadMetadata(stateDir, threadId, metadata) {
 function appendHistoryEntry(stateDir, threadId, entry) {
   const dir = resolveThreadDir(stateDir, threadId);
   fs.mkdirSync(dir, { recursive: true });
-  fs.appendFileSync(path.join(dir, "history.jsonl"), `${JSON.stringify(entry)}\n`);
+  const historyPath = path.join(dir, "history.jsonl");
+
+  // Enforce max entries to prevent unbounded disk growth (DoS)
+  try {
+    const existing = fs.readFileSync(historyPath, "utf8").trim();
+    if (existing) {
+      const lines = existing.split("\n");
+      if (lines.length >= MAX_HISTORY_ENTRIES) {
+        // Keep only the most recent half
+        const trimmed = lines.slice(Math.floor(lines.length / 2));
+        fs.writeFileSync(historyPath, trimmed.join("\n") + "\n");
+      }
+    }
+  } catch {
+    // File doesn't exist yet — that's fine
+  }
+
+  fs.appendFileSync(historyPath, `${JSON.stringify(entry)}\n`);
 }
 
 function readHistory(stateDir, threadId) {
@@ -87,6 +120,21 @@ function listThreads(stateDir, options = {}) {
 // Context assembly — build prompt from conversation history
 // ---------------------------------------------------------------------------
 
+/**
+ * Sanitize history entry to prevent prompt injection.
+ * Strips role-tag patterns that could confuse the model into treating
+ * injected history content as new user/system instructions.
+ */
+function sanitizeHistoryContent(content) {
+  return (content || "")
+    .replace(/\[user\]\s*:/gi, "[prev-user]:")
+    .replace(/\[assistant\]\s*:/gi, "[prev-assistant]:")
+    .replace(/\[system\]\s*:/gi, "[prev-system]:")
+    .replace(/<\/?system>/gi, "")
+    .replace(/<\/?user>/gi, "")
+    .replace(/<\/?assistant>/gi, "");
+}
+
 function buildConversationPrompt(history, newInput) {
   let historyText = "";
   let totalChars = 0;
@@ -109,18 +157,20 @@ function buildConversationPrompt(history, newInput) {
   }
 
   if (oldEntries.length > 0) {
-    const summaryParts = oldEntries.map(
-      (e) => `[${e.role}]: ${(e.content || "").slice(0, 200)}...`
-    );
-    historyText += `[Previous conversation summary (${oldEntries.length} turns):\n${summaryParts.join("\n")}\n]\n\n`;
+    const summaryParts = oldEntries.map((e) => {
+      const role = e.role === "user" ? "user" : "assistant";
+      return `<history-${role}>${sanitizeHistoryContent(e.content).slice(0, 200)}...</history-${role}>`;
+    });
+    historyText += `<previous-conversation-summary turns="${oldEntries.length}">\n${summaryParts.join("\n")}\n</previous-conversation-summary>\n\n`;
   }
 
   for (const entry of recentEntries) {
-    historyText += `[${entry.role}]: ${entry.content}\n\n`;
+    const role = entry.role === "user" ? "user" : "assistant";
+    historyText += `<history-${role}>${sanitizeHistoryContent(entry.content)}</history-${role}>\n\n`;
   }
 
   if (historyText) {
-    return `${historyText}[user]: ${newInput}`;
+    return `<conversation-history>\n${historyText}</conversation-history>\n\n<current-request>\n${newInput}\n</current-request>`;
   }
   return newInput;
 }
@@ -146,15 +196,49 @@ function buildGeminiArgs(prompt, options = {}) {
 /**
  * Spawn `gemini -p` and return a controller for the running process.
  */
+/**
+ * Build a minimal environment for the Gemini CLI process.
+ * Only passes through PATH and auth-related variables to avoid
+ * leaking sensitive enterprise env vars (DB passwords, internal tokens, etc.).
+ */
+function buildSafeEnv(extraEnv = {}) {
+  const safe = {
+    PATH: process.env.PATH,
+    HOME: process.env.HOME,
+    USERPROFILE: process.env.USERPROFILE,
+    HOMEDRIVE: process.env.HOMEDRIVE,
+    HOMEPATH: process.env.HOMEPATH,
+    TMPDIR: process.env.TMPDIR,
+    TEMP: process.env.TEMP,
+    TMP: process.env.TMP,
+    LANG: process.env.LANG,
+    // Gemini auth
+    GEMINI_API_KEY: process.env.GEMINI_API_KEY,
+    GOOGLE_API_KEY: process.env.GOOGLE_API_KEY,
+    GOOGLE_CLOUD_PROJECT: process.env.GOOGLE_CLOUD_PROJECT,
+    GOOGLE_CLOUD_LOCATION: process.env.GOOGLE_CLOUD_LOCATION,
+    GOOGLE_APPLICATION_CREDENTIALS: process.env.GOOGLE_APPLICATION_CREDENTIALS,
+    GOOGLE_GENAI_USE_VERTEXAI: process.env.GOOGLE_GENAI_USE_VERTEXAI,
+    // Display
+    NO_COLOR: "1",
+    ...extraEnv
+  };
+  // Remove undefined values
+  for (const key of Object.keys(safe)) {
+    if (safe[key] === undefined) delete safe[key];
+  }
+  return safe;
+}
+
 function spawnGeminiProcess(prompt, options = {}) {
   const args = buildGeminiArgs(prompt, options);
-  const env = { ...process.env, ...(options.env || {}), NO_COLOR: "1" };
+  const env = buildSafeEnv(options.env);
 
   const proc = spawn("gemini", args, {
     cwd: options.cwd || process.cwd(),
     env,
     stdio: ["pipe", "pipe", "pipe"],
-    shell: process.platform === "win32" ? (process.env.SHELL || true) : false,
+    shell: false,
     windowsHide: true
   });
 
