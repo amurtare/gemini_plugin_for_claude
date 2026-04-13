@@ -112,6 +112,37 @@ Claude Code에서:
 - 대화 히스토리를 디스크에 저장하여 세션 이어가기 지원
 - `/gemini:ask`는 경량 직접 호출로 브로커/데몬 스택 우회
 
+## 데이터 저장 정책
+
+### 저장 위치
+
+| 데이터 | 위치 | 형식 |
+|--------|------|------|
+| 대화 히스토리 | `<CLAUDE_PLUGIN_DATA>/threads/<threadId>/history.jsonl` | JSONL (평문) |
+| 스레드 메타데이터 | `<CLAUDE_PLUGIN_DATA>/threads/<threadId>/metadata.json` | JSON |
+| 작업 상태 | `<CLAUDE_PLUGIN_DATA>/state.json` | JSON |
+| 작업 로그 | `<CLAUDE_PLUGIN_DATA>/jobs/<jobId>.log` | 텍스트 |
+
+`CLAUDE_PLUGIN_DATA`는 Claude Code가 플러그인별로 할당하는 로컬 디렉토리입니다.
+
+### 저장 범위
+
+- **대화 히스토리**: 사용자 프롬프트와 Gemini 응답 텍스트 (세션 이어가기용)
+- **작업 메타데이터**: job ID, 상태, 타임스탬프, threadId (대화 내용 미포함)
+- **로그**: 진행 상황 메시지 (대화 내용 미포함)
+
+### 보존 제한
+
+- 대화 히스토리: 스레드당 최대 **500턴** — 초과 시 오래된 절반 자동 삭제
+- 작업 레코드: 워크스페이스당 최대 **50개** — 초과 시 오래된 것부터 정리
+- 세션 종료 시 해당 세션의 작업 레코드 자동 정리
+
+### 외부 전송
+
+- 모든 데이터는 **로컬 디스크에만** 저장됩니다
+- Google 서버에 세션이 저장되지 않습니다 (클라우드 세션 resume 미사용)
+- Gemini API 호출 시 프롬프트만 전송되며, 히스토리는 로컬에서 프롬프트에 포함하여 전달합니다
+
 ## FAQ
 
 ### Gemini CLI 인증이 안 되어 있으면?
