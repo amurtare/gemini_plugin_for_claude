@@ -12,8 +12,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import process from "node:process";
-
-const DEFAULT_MODEL = "gemini-2.5-flash";
+import { DEFAULT_MODEL, resolveModel } from "./lib/models.mjs";
 
 function resolveGeminiBinary() {
   if (process.platform === "win32") {
@@ -36,7 +35,7 @@ async function main() {
 
   for (let i = 0; i < args.length; i++) {
     if ((args[i] === "--model" || args[i] === "-m") && i + 1 < args.length) {
-      model = args[++i];
+      model = resolveModel(args[++i]) || DEFAULT_MODEL;
     } else {
       promptParts.push(args[i]);
     }
@@ -52,9 +51,20 @@ async function main() {
   const { binary, prefix, shell } = resolveGeminiBinary();
   const geminiArgs = [...prefix, "-p", prompt, "-m", model, "--output-format", "json"];
 
+  // Filtered env — avoid leaking sensitive enterprise env vars
+  const safeEnv = Object.fromEntries(
+    Object.entries(process.env).filter(([key]) =>
+      key.startsWith("GOOGLE_") || key.startsWith("GEMINI_") ||
+      ["PATH", "HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPDATA",
+       "LOCALAPPDATA", "TMPDIR", "TEMP", "TMP", "LANG"
+      ].includes(key)
+    )
+  );
+  safeEnv.NO_COLOR = "1";
+
   const proc = spawn(binary, geminiArgs, {
     cwd: process.cwd(),
-    env: process.env,
+    env: safeEnv,
     stdio: ["pipe", "pipe", "pipe"],
     shell: shell || false,
     windowsHide: true
@@ -95,7 +105,9 @@ async function main() {
   }
 }
 
-main().catch((error) => {
-  process.stderr.write(`${error.message}\n`);
+main().catch(async (error) => {
+  const { classifyError, formatError } = await import("./lib/errors.mjs");
+  const structured = classifyError(error);
+  process.stderr.write(`${formatError(structured)}\n`);
   process.exitCode = 1;
 });

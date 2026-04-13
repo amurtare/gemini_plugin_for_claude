@@ -7,6 +7,7 @@ import process from "node:process";
 import { fileURLToPath } from "node:url";
 
 import { parseArgs, splitRawArgumentString } from "./lib/shared.mjs";
+import { resolveModel, MODEL_ALIASES } from "./lib/models.mjs";
 import {
   buildPersistentTaskThreadName,
   DEFAULT_CONTINUE_PROMPT,
@@ -67,12 +68,7 @@ const REVIEW_SCHEMA = path.join(ROOT_DIR, "schemas", "review-output.schema.json"
 const DEFAULT_STATUS_WAIT_TIMEOUT_MS = 240000;
 const DEFAULT_STATUS_POLL_INTERVAL_MS = 2000;
 const VALID_REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh"]);
-const MODEL_ALIASES = new Map([
-  ["flash", "gemini-2.5-flash"],
-  ["pro", "gemini-2.5-pro"],
-  ["flash-3", "gemini-2.5-flash-preview-04-17"],
-  ["pro-3", "gemini-2.5-pro-preview-03-25"]
-]);
+// MODEL_ALIASES imported from ./lib/models.mjs
 const STOP_REVIEW_TASK_MARKER = "Run a stop-gate review of the previous Claude turn.";
 
 function printUsage() {
@@ -103,14 +99,7 @@ function outputCommandResult(payload, rendered, asJson) {
 }
 
 function normalizeRequestedModel(model) {
-  if (model == null) {
-    return null;
-  }
-  const normalized = String(model).trim();
-  if (!normalized) {
-    return null;
-  }
-  return MODEL_ALIASES.get(normalized.toLowerCase()) ?? normalized;
+  return resolveModel(model);
 }
 
 function normalizeReasoningEffort(effort) {
@@ -576,9 +565,19 @@ async function runForegroundCommand(job, runner, options = {}) {
 
 function spawnDetachedTaskWorker(cwd, jobId) {
   const scriptPath = path.join(ROOT_DIR, "scripts", "gemini-companion.mjs");
+  // Use filtered env to avoid leaking sensitive enterprise env vars
+  const safeEnv = Object.fromEntries(
+    Object.entries(process.env).filter(([key]) =>
+      key.startsWith("GOOGLE_") || key.startsWith("GEMINI_") ||
+      ["PATH", "HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPDATA",
+       "LOCALAPPDATA", "TMPDIR", "TEMP", "TMP", "LANG", "NODE_PATH",
+       "CLAUDE_PLUGIN_DATA", "CLAUDE_PLUGIN_ROOT", "CLAUDE_ENV_FILE"
+      ].includes(key)
+    )
+  );
   const child = spawn(process.execPath, [scriptPath, "task-worker", "--cwd", cwd, "--job-id", jobId], {
     cwd,
-    env: process.env,
+    env: safeEnv,
     detached: true,
     stdio: "ignore",
     windowsHide: true
@@ -956,8 +955,9 @@ async function main() {
   }
 }
 
-main().catch((error) => {
-  const message = error instanceof Error ? error.message : String(error);
-  process.stderr.write(`${message}\n`);
+main().catch(async (error) => {
+  const { classifyError, formatError } = await import("./lib/errors.mjs");
+  const structured = classifyError(error);
+  process.stderr.write(`${formatError(structured)}\n`);
   process.exitCode = 1;
 });

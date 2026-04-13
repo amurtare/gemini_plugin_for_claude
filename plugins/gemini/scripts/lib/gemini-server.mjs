@@ -13,6 +13,7 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import readline from "node:readline";
 import { createSession, resumeSession, isAlive } from "./acp-lifecycle.mjs";
+import { DEFAULT_MODEL } from "./models.mjs";
 
 const MAX_HISTORY_CHARS = 100_000;
 const MAX_HISTORY_ENTRIES = 500;
@@ -181,7 +182,7 @@ function buildConversationPrompt(history, newInput) {
 // ---------------------------------------------------------------------------
 
 const GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta";
-const DEFAULT_MODEL = "gemini-2.5-flash";
+// DEFAULT_MODEL imported from ./models.mjs
 const TOKEN_EXPIRY_BUFFER_MS = 60_000; // refresh 1 min before expiry
 
 /**
@@ -873,19 +874,32 @@ export class GeminiAppServer {
       this.acpSessionId = sessionId;
       this.acpReady = true;
 
-      // Allow file operations only in write mode
+      // Allow file operations only in write mode, restricted to workspace
       if (sandbox === "workspace-write") {
+        const workspaceRoot = path.resolve(metadata.cwd);
+
+        const isPathWithinWorkspace = (filePath) => {
+          const resolved = path.resolve(workspaceRoot, filePath);
+          return resolved.startsWith(workspaceRoot + path.sep) || resolved === workspaceRoot;
+        };
+
         client.onServerRequest("read_text_file", (params) => {
+          if (!params.path || !isPathWithinWorkspace(params.path)) {
+            return { content: "", error: "Access denied: path is outside workspace." };
+          }
           try {
-            const content = fs.readFileSync(params.path, "utf8");
+            const content = fs.readFileSync(path.resolve(workspaceRoot, params.path), "utf8");
             return { content };
           } catch (err) {
             return { content: "", error: err.message };
           }
         });
         client.onServerRequest("write_text_file", (params) => {
+          if (!params.path || !isPathWithinWorkspace(params.path)) {
+            return { error: "Access denied: path is outside workspace." };
+          }
           try {
-            fs.writeFileSync(params.path, params.content, "utf8");
+            fs.writeFileSync(path.resolve(workspaceRoot, params.path), params.content, "utf8");
             return {};
           } catch (err) {
             return { error: err.message };
@@ -917,7 +931,7 @@ export class GeminiAppServer {
         if (text) finalMessage += text;
       }
     };
-    this.acpClient.onUpdate(updateHandler);
+    const unsubscribe = this.acpClient.onUpdate(updateHandler);
 
     try {
       // Send prompt
@@ -967,6 +981,8 @@ export class GeminiAppServer {
         params: { threadId, turnId, turn: { id: turnId, status: "failed" } }
       });
       throw error;
+    } finally {
+      unsubscribe();
     }
   }
 

@@ -42,7 +42,12 @@
       "Bash(gh repo:*)",
       "Bash(git ls-remote:*)",
       "Bash(gemini --version)",
-      "Bash(gemini --help)"
+      "Bash(gemini --help)",
+      "Bash(cp D:/Git/agent_plugin/plugins/gemini/commands/task.md C:/Users/amurtare/.claude-enterprise/plugins/cache/gemini-plugin-for-claude/gemini/0.1.0/commands/task.md)",
+      "Bash(cp D:/Git/agent_plugin/plugins/gemini/scripts/lib/acp-client.mjs C:/Users/amurtare/.claude-enterprise/plugins/cache/gemini-plugin-for-claude/gemini/0.1.0/scripts/lib/acp-client.mjs)",
+      "Bash(cp D:/Git/agent_plugin/plugins/gemini/scripts/lib/acp-lifecycle.mjs C:/Users/amurtare/.claude-enterprise/plugins/cache/gemini-plugin-for-claude/gemini/0.1.0/scripts/lib/acp-lifecycle.mjs)",
+      "Bash(cp D:/Git/agent_plugin/plugins/gemini/scripts/lib/gemini-server.mjs C:/Users/amurtare/.claude-enterprise/plugins/cache/gemini-plugin-for-claude/gemini/0.1.0/scripts/lib/gemini-server.mjs)",
+      "Bash(cp D:/Git/agent_plugin/plugins/gemini/scripts/gemini-companion.mjs C:/Users/amurtare/.claude-enterprise/plugins/cache/gemini-plugin-for-claude/gemini/0.1.0/scripts/gemini-companion.mjs)"
     ]
   }
 }
